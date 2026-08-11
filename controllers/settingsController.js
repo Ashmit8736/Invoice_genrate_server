@@ -1,28 +1,35 @@
-const db = require('../config/db');
+const prisma = require('../prisma/client');
 
 exports.getSettings = async (req, res, next) => {
     try {
-        const [rows] = await db.query('SELECT * FROM settings LIMIT 1');
-        if (rows.length === 0) {
-            return res.json(null);
+        const settings = await prisma.settings.findFirst();
+        if (settings) {
+            res.json(settings);
+        } else {
+            res.json({ message: 'No settings found' });
         }
-        res.json(rows[0]);
     } catch (err) {
         next(err);
     }
 };
 
 exports.updateSettings = async (req, res, next) => {
+    const { company_name, address, gstin, pan, state_code } = req.body;
     try {
-        const { company_name, address, gstin, pan, state_code } = req.body;
-        const [existing] = await db.query('SELECT * FROM settings LIMIT 1');
+        let settings = await prisma.settings.findFirst();
         
-        if (existing.length === 0) {
-            await db.query('INSERT INTO settings (company_name, address, gstin, pan, state_code) VALUES (?, ?, ?, ?, ?)', [company_name, address, gstin, pan, state_code]);
+        if (settings) {
+            settings = await prisma.settings.update({
+                where: { id: settings.id },
+                data: { company_name, address, gstin, pan, state_code }
+            });
+            res.json({ message: 'Settings updated successfully', settings });
         } else {
-            await db.query('UPDATE settings SET company_name=?, address=?, gstin=?, pan=?, state_code=? WHERE id=?', [company_name, address, gstin, pan, state_code, existing[0].id]);
+            settings = await prisma.settings.create({
+                data: { company_name, address, gstin, pan, state_code }
+            });
+            res.status(201).json({ message: 'Settings created successfully', settings });
         }
-        res.json({ message: 'Settings updated successfully' });
     } catch (err) {
         next(err);
     }

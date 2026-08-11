@@ -1,15 +1,19 @@
-const db = require('../config/db');
+const prisma = require('../prisma/client');
 const xlsx = require('xlsx');
 
 exports.getInvoices = async (req, res, next) => {
     try {
-        const [rows] = await db.query(`
-            SELECT i.*, c.name as customer_name 
-            FROM invoices i 
-            JOIN customers c ON i.customer_id = c.id 
-            ORDER BY i.created_at DESC
-        `);
-        res.json(rows);
+        const invoices = await prisma.invoice.findMany({
+            include: { customer: true },
+            orderBy: { created_at: 'desc' }
+        });
+        
+        const mappedInvoices = invoices.map(inv => ({
+            ...inv,
+            customer_name: inv.customer ? inv.customer.name : 'Unknown'
+        }));
+        
+        res.json(mappedInvoices);
     } catch (err) {
         next(err);
     }
@@ -18,160 +22,168 @@ exports.getInvoices = async (req, res, next) => {
 exports.getInvoiceById = async (req, res, next) => {
     try {
         const { id } = req.params;
-        const [invoice] = await db.query(`
-            SELECT i.*, c.name as customer_name, c.shipping_address, c.phone, c.gstin as customer_gstin, c.state_code as customer_state
-            FROM invoices i 
-            JOIN customers c ON i.customer_id = c.id 
-            WHERE i.id = ?
-        `, [id]);
+        const invoice = await prisma.invoice.findUnique({
+            where: { id: parseInt(id) },
+            include: { customer: true, items: true }
+        });
         
-        if (invoice.length === 0) return res.status(404).json({ message: 'Invoice not found' });
+        if (!invoice) return res.status(404).json({ message: 'Invoice not found' });
         
-        const [items] = await db.query('SELECT * FROM invoice_items WHERE invoice_id = ?', [id]);
+        const mappedInvoice = {
+            ...invoice,
+            customer_name: invoice.customer?.name,
+            shipping_address: invoice.customer?.shipping_address,
+            phone: invoice.customer?.phone,
+            customer_gstin: invoice.customer?.gstin,
+            customer_state: invoice.customer?.state_code
+        };
         
-        res.json({ ...invoice[0], items });
+        res.json(mappedInvoice);
     } catch (err) {
         next(err);
     }
 };
 
 exports.createInvoice = async (req, res, next) => {
-    const connection = await db.getConnection();
     try {
-        await connection.beginTransaction();
         const {
             order_id, invoice_date, payment_mode, fulfillment_type, status,
             customer_id, net_subtotal, cgst_amount, sgst_amount, igst_amount,
             total_amount, amount_in_words, items
         } = req.body;
 
-        const [result] = await connection.query(
-            `INSERT INTO invoices 
-            (order_id, invoice_date, payment_mode, fulfillment_type, status, customer_id, 
-            net_subtotal, cgst_amount, sgst_amount, igst_amount, total_amount, amount_in_words) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [order_id, invoice_date, payment_mode, fulfillment_type, status, customer_id, 
-             net_subtotal, cgst_amount, sgst_amount, igst_amount, total_amount, amount_in_words]
-        );
+        const newInvoice = await prisma.invoice.create({
+            data: {
+                order_id,
+                invoice_date: new Date(invoice_date),
+                payment_mode,
+                fulfillment_type,
+                status,
+                customer_id: parseInt(customer_id),
+                net_subtotal,
+                cgst_amount,
+                sgst_amount,
+                igst_amount,
+                total_amount,
+                amount_in_words,
+                items: {
+                    create: items.map(item => ({
+                        description: item.description,
+                        supplier_name: item.supplier_name || '',
+                        quantity: parseInt(item.quantity),
+                        unit_price: item.unit_price,
+                        gst_rate: item.gst_rate,
+                        total: item.total
+                    }))
+                }
+            }
+        });
         
-        const invoiceId = result.insertId;
-        
-        for (let item of items) {
-            await connection.query(
-                `INSERT INTO invoice_items 
-                (invoice_id, description, supplier_name, quantity, unit_price, gst_rate, total) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [invoiceId, item.description, item.supplier_name || '', item.quantity, item.unit_price, item.gst_rate, item.total]
-            );
-        }
-
-        await connection.commit();
-        res.status(201).json({ id: invoiceId, message: 'Invoice created successfully' });
+        res.status(201).json({ id: newInvoice.id, message: 'Invoice created successfully' });
     } catch (err) {
-        await connection.rollback();
         next(err);
-    } finally {
-        connection.release();
     }
 };
 
-// Extremely simplified Excel import for demo purposes
-// In reality, this would need complex validation
 exports.importInvoices = async (req, res, next) => {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
     
-    const connection = await db.getConnection();
     try {
         const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         const data = xlsx.utils.sheet_to_json(sheet);
         
-        await connection.beginTransaction();
-        
-        // Very basic bulk import logic
-        // Expects format: Order ID, Invoice Date, Customer Name, Phone, Shipping Address, State Code, GSTIN, Payment Mode, Fulfillment Type, Item Description, Quantity, Unit Price, GST Rate (%)
-        
-        // Get settings for calculation
-        const [settingsRows] = await connection.query('SELECT state_code FROM settings LIMIT 1');
-        const sellerStateCode = settingsRows.length > 0 ? settingsRows[0].state_code : '27';
+        const settings = await prisma.settings.findFirst();
+        const sellerStateCode = settings ? settings.state_code : '27';
         
         let importedCount = 0;
         
-        for (let row of data) {
-            const orderId = row['Order ID'];
-            if (!orderId) continue;
-            
-            // 1. Check or create customer
-            let customerId = null;
-            const [custRows] = await connection.query('SELECT id FROM customers WHERE name = ? AND phone = ? LIMIT 1', [row['Customer Name'], row['Phone']]);
-            
-            if (custRows.length > 0) {
-                customerId = custRows[0].id;
-            } else {
-                const [newCust] = await connection.query(
-                    'INSERT INTO customers (name, shipping_address, phone, gstin, state_code) VALUES (?, ?, ?, ?, ?)',
-                    [row['Customer Name'], row['Shipping Address'], row['Phone'], row['GSTIN'] || '', row['State Code'] || '']
-                );
-                customerId = newCust.insertId;
+        await prisma.$transaction(async (tx) => {
+            for (let row of data) {
+                const orderId = row['Order ID'];
+                if (!orderId) continue;
+                
+                let customer = await tx.customer.findFirst({
+                    where: { name: row['Customer Name'], phone: String(row['Phone']) }
+                });
+                
+                if (!customer) {
+                    customer = await tx.customer.create({
+                        data: {
+                            name: row['Customer Name'],
+                            shipping_address: row['Shipping Address'],
+                            phone: String(row['Phone']),
+                            gstin: row['GSTIN'] ? String(row['GSTIN']) : null,
+                            state_code: row['State Code'] ? String(row['State Code']) : ''
+                        }
+                    });
+                }
+                
+                const qty = Number(row['Quantity'] || 1);
+                const unitPrice = Number(row['Unit Price'] || 0);
+                const gstRate = Number(row['GST Rate (%)'] || 18);
+                
+                const netSubtotal = qty * unitPrice;
+                const totalGst = (netSubtotal * gstRate) / 100;
+                
+                const buyerStateCode = row['State Code'] ? String(row['State Code']) : '';
+                let cgst = 0, sgst = 0, igst = 0;
+                
+                if (sellerStateCode === buyerStateCode) {
+                    cgst = totalGst / 2;
+                    sgst = totalGst / 2;
+                } else {
+                    igst = totalGst;
+                }
+                
+                const grandTotal = netSubtotal + totalGst;
+                const amountInWords = "Auto Generated from Import";
+                
+                let invoice = await tx.invoice.findFirst({
+                    where: { order_id: String(orderId) }
+                });
+                
+                if (!invoice) {
+                    invoice = await tx.invoice.create({
+                        data: {
+                            order_id: String(orderId),
+                            invoice_date: row['Invoice Date'] ? new Date(row['Invoice Date']) : new Date(),
+                            payment_mode: row['Payment Mode'] || 'Online',
+                            fulfillment_type: row['Fulfillment Type'] || 'Courier',
+                            status: 'Paid',
+                            customer_id: customer.id,
+                            net_subtotal: netSubtotal,
+                            cgst_amount: cgst,
+                            sgst_amount: sgst,
+                            igst_amount: igst,
+                            total_amount: grandTotal,
+                            amount_in_words: amountInWords
+                        }
+                    });
+                    importedCount++;
+                }
+                
+                await tx.invoiceItem.create({
+                    data: {
+                        invoice_id: invoice.id,
+                        description: row['Item Description'],
+                        supplier_name: '',
+                        quantity: qty,
+                        unit_price: unitPrice,
+                        gst_rate: gstRate,
+                        total: netSubtotal
+                    }
+                });
             }
-            
-            // 2. Calculate values
-            const qty = Number(row['Quantity'] || 1);
-            const unitPrice = Number(row['Unit Price'] || 0);
-            const gstRate = Number(row['GST Rate (%)'] || 18);
-            
-            const netSubtotal = qty * unitPrice;
-            const totalGst = (netSubtotal * gstRate) / 100;
-            
-            const buyerStateCode = row['State Code'] || '';
-            let cgst = 0, sgst = 0, igst = 0;
-            
-            if (sellerStateCode === buyerStateCode) {
-                cgst = totalGst / 2;
-                sgst = totalGst / 2;
-            } else {
-                igst = totalGst;
-            }
-            
-            const grandTotal = netSubtotal + totalGst;
-            
-            // Helper for simple number to words
-            const amountInWords = "Auto Generated from Import"; // Simplified for bulk
-            
-            // 3. Insert Invoice
-            // Check if invoice already exists
-            const [invRows] = await connection.query('SELECT id FROM invoices WHERE order_id = ?', [orderId]);
-            let invoiceId;
-            
-            if (invRows.length === 0) {
-                const [newInv] = await connection.query(
-                    `INSERT INTO invoices (order_id, invoice_date, payment_mode, fulfillment_type, status, customer_id, net_subtotal, cgst_amount, sgst_amount, igst_amount, total_amount, amount_in_words) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [orderId, row['Invoice Date'] || new Date().toISOString().split('T')[0], row['Payment Mode'] || 'Online', row['Fulfillment Type'] || 'Courier', 'Paid', customerId, netSubtotal, cgst, sgst, igst, grandTotal, amountInWords]
-                );
-                invoiceId = newInv.insertId;
-                importedCount++;
-            } else {
-                invoiceId = invRows[0].id;
-                // If it exists, we could update or just add the line item. Let's just assume 1 order = 1 invoice for simplicity in this demo
-            }
-            
-            // 4. Insert Item
-            await connection.query(
-                `INSERT INTO invoice_items (invoice_id, description, supplier_name, quantity, unit_price, gst_rate, total) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [invoiceId, row['Item Description'], '', qty, unitPrice, gstRate, netSubtotal]
-            );
-        }
+        }, {
+            maxWait: 10000,
+            timeout: 20000,
+        });
         
-        await connection.commit();
         res.json({ message: `Successfully imported ${importedCount} invoices!` });
     } catch (err) {
-        await connection.rollback();
         console.error(err);
         next(err);
-    } finally {
-        connection.release();
     }
 };

@@ -1,35 +1,42 @@
-const db = require('../config/db');
+const prisma = require('../prisma/client');
 
 exports.getCustomers = async (req, res, next) => {
     try {
-        const [rows] = await db.query('SELECT * FROM customers ORDER BY created_at DESC');
-        res.json(rows);
+        const customers = await prisma.customer.findMany({
+            orderBy: { created_at: 'desc' }
+        });
+        res.json(customers);
     } catch (err) {
         next(err);
     }
 };
 
 exports.addCustomer = async (req, res, next) => {
+    const { name, shipping_address, phone, gstin, state_code } = req.body;
     try {
-        const { name, shipping_address, phone, gstin, state_code } = req.body;
-        const [result] = await db.query(
-            'INSERT INTO customers (name, shipping_address, phone, gstin, state_code) VALUES (?, ?, ?, ?, ?)',
-            [name, shipping_address, phone, gstin, state_code]
-        );
-        res.status(201).json({ id: result.insertId, message: 'Customer added successfully' });
+        const newCustomer = await prisma.customer.create({
+            data: {
+                name,
+                shipping_address,
+                phone,
+                gstin: gstin || null,
+                state_code
+            }
+        });
+        res.status(201).json({ message: 'Customer added successfully', id: newCustomer.id, customer: newCustomer });
     } catch (err) {
         next(err);
     }
 };
 
 exports.updateCustomer = async (req, res, next) => {
+    const { id } = req.params;
+    const { name, shipping_address, phone, gstin, state_code } = req.body;
     try {
-        const { id } = req.params;
-        const { name, shipping_address, phone, gstin, state_code } = req.body;
-        await db.query(
-            'UPDATE customers SET name=?, shipping_address=?, phone=?, gstin=?, state_code=? WHERE id=?',
-            [name, shipping_address, phone, gstin, state_code, id]
-        );
+        await prisma.customer.update({
+            where: { id: parseInt(id) },
+            data: { name, shipping_address, phone, gstin, state_code }
+        });
         res.json({ message: 'Customer updated successfully' });
     } catch (err) {
         next(err);
@@ -37,9 +44,11 @@ exports.updateCustomer = async (req, res, next) => {
 };
 
 exports.deleteCustomer = async (req, res, next) => {
+    const { id } = req.params;
     try {
-        const { id } = req.params;
-        await db.query('DELETE FROM customers WHERE id=?', [id]);
+        await prisma.customer.delete({
+            where: { id: parseInt(id) }
+        });
         res.json({ message: 'Customer deleted successfully' });
     } catch (err) {
         next(err);
